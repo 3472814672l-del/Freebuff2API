@@ -20,17 +20,41 @@ const (
 )
 
 // hardcodedFallback is used when the remote fetch fails on startup.
+// Updated 2026-09-01 from Codebuff source code analysis.
 var hardcodedFallback = map[string][]string{
-	"base2-free":         {"minimax/minimax-m2.7", "z-ai/glm-5.1"},
-	"file-picker":        {"google/gemini-2.5-flash-lite"},
-	"file-picker-max":    {"google/gemini-3.1-flash-lite-preview"},
-	"file-lister":        {"google/gemini-3.1-flash-lite-preview"},
-	"researcher-web":     {"google/gemini-3.1-flash-lite-preview"},
-	"researcher-docs":    {"google/gemini-3.1-flash-lite-preview"},
-	"basher":             {"google/gemini-3.1-flash-lite-preview"},
-	"editor-lite":        {"minimax/minimax-m2.7", "z-ai/glm-5.1"},
-	"code-reviewer-lite": {"minimax/minimax-m2.7", "z-ai/glm-5.1"},
+	"base2-free":                  {"mimo/mimo-v2.5", "z-ai/glm-5.3-flash", "z-ai/glm-5.2"},
+	"base2-free-mimo":              {"mimo/mimo-v2.5"},
+	"base2-free-glm":               {"z-ai/glm-5.2"},
+	"base2-free-glm-5-3-flash":     {"z-ai/glm-5.3-flash"},
+	"base2-free-luna":              {"openai/gpt-5.6-luna"},
+	"base2-free-luna-es":           {"openai/gpt-5.6-luna-es"},
+	"base2-free-solar-pro4":        {"upstage/solar-pro4"},
+	"base2-free-ox-alpha":          {"stealth/ox-alpha"},
+	"base2-free-fable":             {"anthropic/claude-fable-5"},
+	"base2-free-muse-spark":        {"meta/muse-spark-1.2-contributor"},
+	"base2-free-kimi-k3-eco":      {"crof/kimi-k3-eco"},
+	"base2-free-deepseek":          {"deepseek/deepseek-v4-pro"},
+	"base2-free-deepseek-flash":    {"deepseek/deepseek-v4-flash"},
+	"base2-free-deepseek-pro-max":  {"deepseek/deepseek-v4-pro-max"},
+	"base2-free-deepseek-flash-max": {"deepseek/deepseek-v4-flash-max"},
+	"base2-free-luna-max":          {"openai/gpt-5.6-luna-max"},
+	"base2-free-cloud-planner":     {"mimo/mimo-v2.5"},
 }
+
+// pausedFreeModels lists models withdrawn from free mode by Codebuff.
+// Requests for these models are silently coerced to the fallback by the upstream.
+// Updated 2026-09-01.
+var pausedFreeModels = map[string]bool{
+	"minimax/minimax-m3":       true, // paused 2026-08-20, cost $213/hr
+	"deepseek/deepseek-v4-pro":  true, // paused 2026-08-26, cost too high
+	"stealth/ox-alpha":         true, // paused 2026-08-27, host ended free promo
+}
+
+// precompiled regexes for parsing free-agents.ts
+var (
+	blockPattern = regexp.MustCompile(`'([^']+)':\s*new\s+Set\(\[([^\]]*)\]\)`)
+	modelPattern = regexp.MustCompile(`'([^']+)'`)
+)
 
 // ModelRegistry fetches and caches the agent→model mapping for all free agents
 // from the upstream free-agents.ts source file.
@@ -98,12 +122,22 @@ func (r *ModelRegistry) Models() []string {
 	return out
 }
 
-// HasModel checks if the given model is available.
+// HasModel checks if the given model is available (not paused).
 func (r *ModelRegistry) HasModel(model string) bool {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	_, ok := r.modelToAgent[model]
-	return ok
+	if _, ok := r.modelToAgent[model]; !ok {
+		return false
+	}
+	return !pausedFreeModels[model]
+}
+
+// IsPausedModel returns true if the model is known but paused by upstream.
+func (r *ModelRegistry) IsPausedModel(model string) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	_, known := r.modelToAgent[model]
+	return known && pausedFreeModels[model]
 }
 
 // AgentForModel returns the agent ID that should serve the given model.
@@ -152,6 +186,20 @@ func (r *ModelRegistry) refresh(ctx context.Context) error {
 		return fmt.Errorf("no free agents found in source")
 	}
 
+	// Validate that the parsed result contains root agents (base2-free*).
+	// If the upstream file format changes and only subagents are parsed,
+	// fall back to the hardcoded list instead of using an incomplete result.
+	hasRoot := false
+	for agentID := range all {
+		if strings.HasPrefix(agentID, "base2-free") {
+			hasRoot = true
+			break
+		}
+	}
+	if !hasRoot {
+		return fmt.Errorf("parsed agents do not contain any base2-free root agents (upstream format may have changed)")
+	}
+
 	modelToAgent, allModels := buildModelMapping(all)
 
 	r.mu.Lock()
@@ -179,9 +227,6 @@ func (r *ModelRegistry) loadFallback() {
 
 // parseAllFreeModels extracts ALL agent→models mappings from the free-agents.ts source.
 func parseAllFreeModels(source string) map[string][]string {
-	blockPattern := regexp.MustCompile(`'([^']+)':\s*new\s+Set\(\[([^\]]*)\]\)`)
-	modelPattern := regexp.MustCompile(`'([^']+)'`)
-
 	result := make(map[string][]string)
 	for _, match := range blockPattern.FindAllStringSubmatch(source, -1) {
 		agentID := match[1]

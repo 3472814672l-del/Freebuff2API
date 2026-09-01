@@ -43,6 +43,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/v1/chat/completions", s.handleChatCompletions)
 	mux.HandleFunc("/v1/messages", s.handleClaudeMessages)
 	mux.HandleFunc("/v1/messages/count_tokens", s.handleClaudeCountTokens)
+	mux.HandleFunc("/v1/usage", s.handleUsage)
 	return s.withMiddleware(mux)
 }
 
@@ -116,13 +117,25 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	modelsList := s.registry.Models()
 	models := make([]map[string]any, 0, len(modelsList))
 	for _, model := range modelsList {
+		meta := getModelMeta(model)
 		models = append(models, map[string]any{
-			"id":         model,
-			"object":     "model",
-			"created":    created,
-			"owned_by":   "Freebuff2API",
-			"root":       model,
-			"permission": []any{},
+			"id":             model,
+			"object":         "model",
+			"created":        created,
+			"owned_by":       "Freebuff2API",
+			"name":            meta.Name,
+			"description":     meta.Description,
+			"context_length":  meta.ContextLength,
+			"max_tokens":      meta.MaxTokens,
+			"multimodal":      meta.Multimodal,
+			"streaming":       meta.Streaming,
+			"reasoning":       meta.Reasoning,
+			"tier":            meta.Tier,
+			"premium":         meta.Premium,
+			"available":      meta.Available,
+			"tags":            meta.Tags,
+			"root":            model,
+			"permission":      []any{},
 		})
 	}
 
@@ -157,6 +170,17 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Resolve alias → full model ID
+	requestedModel = resolveAlias(requestedModel, s.cfg.ModelAliases)
+
+	// Auto-fallback: if model is paused/unavailable, use fallback
+	if s.registry.IsPausedModel(requestedModel) {
+		fallback := resolveFallback(requestedModel, s.cfg.ModelFallbacks)
+		s.logger.Printf("model %q is paused, falling back to %q", requestedModel, fallback)
+		requestedModel = fallback
+		payload["model"] = requestedModel
+	}
+
 	s.proxyChatRequest(
 		w,
 		r,
@@ -186,6 +210,17 @@ func (s *Server) handleClaudeMessages(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeClaudeError(w, http.StatusBadRequest, err.Error(), "invalid_request_error")
 		return
+	}
+
+	// Resolve alias → full model ID
+	requestedModel = resolveAlias(requestedModel, s.cfg.ModelAliases)
+
+	// Auto-fallback: if model is paused/unavailable, use fallback
+	if s.registry.IsPausedModel(requestedModel) {
+		fallback := resolveFallback(requestedModel, s.cfg.ModelFallbacks)
+		s.logger.Printf("model %q is paused, falling back to %q", requestedModel, fallback)
+		requestedModel = fallback
+		payload["model"] = requestedModel
 	}
 
 	if _, ok := s.registry.AgentForModel(requestedModel); !ok {
@@ -228,9 +263,17 @@ func (s *Server) handleClaudeCountTokens(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	// Resolve alias → full model ID (for count_tokens)
+	requestedModel = resolveAlias(requestedModel, s.cfg.ModelAliases)
+
 	if !s.registry.HasModel(requestedModel) {
-		writeClaudeError(w, http.StatusBadRequest, fmt.Sprintf("unsupported model %q", requestedModel), "invalid_request_error")
-		return
+		// Try fallback for paused models
+		if s.registry.IsPausedModel(requestedModel) {
+			requestedModel = resolveFallback(requestedModel, s.cfg.ModelFallbacks)
+		} else {
+			writeClaudeError(w, http.StatusBadRequest, fmt.Sprintf("unsupported model %q", requestedModel), "invalid_request_error")
+			return
+		}
 	}
 
 	count, err := countOpenAIPayloadTokens(requestedModel, payload)
@@ -719,6 +762,21 @@ func copyResponseBody(w http.ResponseWriter, body io.Reader) error {
 	}
 }
 
+func (s *Server) handleUsage(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeOpenAIError(w, http.StatusMethodNotAllowed, "method not allowed", "invalid_request_error", "")
+		return
+	}
+
+	response := map[string]any{
+		"service":     "freebuff2api",
+		"uptime_sec":  int(time.Since(s.started).Seconds()),
+		"started_at":   s.started.UTC(),
+		"token_state": s.runs.Snapshots(),
+	}
+	writeJSON(w, http.StatusOK, response)
+}
+
 func isRunInvalid(statusCode int, body []byte) bool {
 	if statusCode != http.StatusBadRequest {
 		return false
@@ -796,11 +854,4 @@ func writeJSON(w http.ResponseWriter, statusCode int, payload any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(statusCode)
 	_, _ = w.Write(body)
-}
-
-func maxDuration(a, b time.Duration) time.Duration {
-	if a > b {
-		return a
-	}
-	return b
 }

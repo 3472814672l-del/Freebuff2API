@@ -21,16 +21,20 @@ type Config struct {
 	UserAgent        string
 	APIKeys          []string
 	HTTPProxy        string
+	ModelAliases     map[string]string   `json:"-"` // short-name → full model ID
+	ModelFallbacks   map[string][]string `json:"-"` // model → ordered fallback chain
 }
 
 type rawConfig struct {
-	ListenAddr       string   `json:"LISTEN_ADDR"`
-	UpstreamBaseURL  string   `json:"UPSTREAM_BASE_URL"`
-	AuthTokens       []string `json:"AUTH_TOKENS"`
-	RotationInterval string   `json:"ROTATION_INTERVAL"`
-	RequestTimeout   string   `json:"REQUEST_TIMEOUT"`
-	APIKeys          []string `json:"API_KEYS"`
-	HTTPProxy        string   `json:"HTTP_PROXY"`
+	ListenAddr       string              `json:"LISTEN_ADDR"`
+	UpstreamBaseURL  string              `json:"UPSTREAM_BASE_URL"`
+	AuthTokens       []string            `json:"AUTH_TOKENS"`
+	RotationInterval string              `json:"ROTATION_INTERVAL"`
+	RequestTimeout   string              `json:"REQUEST_TIMEOUT"`
+	APIKeys          []string            `json:"API_KEYS"`
+	HTTPProxy        string              `json:"HTTP_PROXY"`
+	ModelAliases     map[string]string   `json:"MODEL_ALIASES"`
+	ModelFallbacks   map[string][]string `json:"MODEL_FALLBACKS"`
 }
 
 func loadConfig(configPath string) (Config, error) {
@@ -66,6 +70,8 @@ func loadConfig(configPath string) (Config, error) {
 		UserAgent:        generateUserAgent(),
 		APIKeys:          dedupeStrings(cfg.APIKeys),
 		HTTPProxy:        strings.TrimSpace(cfg.HTTPProxy),
+		ModelAliases:     cfg.ModelAliases,
+		ModelFallbacks:   cfg.ModelFallbacks,
 	}
 
 	switch {
