@@ -1,1 +1,0 @@
-{"model":"deepseek/deepseek-v4-flash","messages":[{"role":"user","content":"hi"}],"max_tokens":5,"codebuff_metadata":{"run_id":"test","client_id":"test","cost_mode":"free","agent_id":"base2-free-deepseek"},"provider":{"allow_fallbacks":true}}

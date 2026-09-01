@@ -263,20 +263,13 @@ func (s *Server) handleClaudeCountTokens(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	// Resolve alias → full model ID (for count_tokens)
-	requestedModel = resolveAlias(requestedModel, s.cfg.ModelAliases)
-
-	if !s.registry.HasModel(requestedModel) {
-		// Try fallback for paused models
-		if s.registry.IsPausedModel(requestedModel) {
-			requestedModel = resolveFallback(requestedModel, s.cfg.ModelFallbacks)
-		} else {
-			writeClaudeError(w, http.StatusBadRequest, fmt.Sprintf("unsupported model %q", requestedModel), "invalid_request_error")
-			return
-		}
+	targetModel, _, ok := s.registry.ResolveModelAndAgent(requestedModel)
+	if !ok {
+		writeClaudeError(w, http.StatusBadRequest, fmt.Sprintf("unsupported model %q", requestedModel), "invalid_request_error")
+		return
 	}
 
-	count, err := countOpenAIPayloadTokens(requestedModel, payload)
+	count, err := countOpenAIPayloadTokens(targetModel, payload)
 	if err != nil {
 		s.logger.Printf("count_tokens failed for model %s: %v", requestedModel, err)
 		writeClaudeError(w, http.StatusBadGateway, "failed to estimate input tokens", "api_error")
@@ -301,7 +294,7 @@ func (s *Server) proxyChatRequest(
 ) {
 	startTime := time.Now()
 
-	agentID, ok := s.registry.AgentForModel(requestedModel)
+	targetModel, agentID, ok := s.registry.ResolveModelAndAgent(requestedModel)
 	if !ok {
 		writeError(w, http.StatusBadRequest, fmt.Sprintf("unsupported model %q", requestedModel), invalidRequestType, "model_not_found")
 		return
@@ -322,7 +315,7 @@ func (s *Server) proxyChatRequest(
 			return
 		}
 
-		s.logger.Printf("[%s] Routing request (model: %s) via run: %s", lease.pool.name, requestedModel, lease.run.id)
+		s.logger.Printf("[%s] Routing request (model: %s -> %s) via run: %s", lease.pool.name, requestedModel, targetModel, lease.run.id)
 
 		sessionInstanceID, err := lease.pool.ensureSession(r.Context())
 		if err != nil {
@@ -339,7 +332,7 @@ func (s *Server) proxyChatRequest(
 			return
 		}
 
-		upstreamBody, err := s.injectUpstreamMetadata(payload, requestedModel, lease.run.id, sessionInstanceID, agentID)
+		upstreamBody, err := s.injectUpstreamMetadata(payload, targetModel, lease.run.id, sessionInstanceID)
 		if err != nil {
 			s.runs.Release(lease)
 			writeError(w, http.StatusBadRequest, err.Error(), invalidRequestType, "")
@@ -397,9 +390,9 @@ func writeOpenAISuccessResponse(w http.ResponseWriter, resp *http.Response) erro
 	return copyResponseBody(w, resp.Body)
 }
 
-func (s *Server) injectUpstreamMetadata(payload map[string]any, requestedModel, runID, sessionInstanceID, agentID string) ([]byte, error) {
+func (s *Server) injectUpstreamMetadata(payload map[string]any, targetModel, runID, sessionInstanceID string) ([]byte, error) {
 	cloned := cloneMap(payload)
-	cloned["model"] = requestedModel
+	cloned["model"] = targetModel
 
 	// Normalize tool parameter schemas into a conservative subset the upstream
 	// backend can parse. This keeps LobeChat-style schemas working without
@@ -415,22 +408,10 @@ func (s *Server) injectUpstreamMetadata(payload map[string]any, requestedModel, 
 	metadata["run_id"] = runID
 	metadata["cost_mode"] = "free"
 	metadata["client_id"] = generateClientSessionId()
-	if strings.TrimSpace(agentID) != "" {
-		metadata["agent_id"] = agentID
-	}
 	if strings.TrimSpace(sessionInstanceID) != "" {
 		metadata["freebuff_instance_id"] = sessionInstanceID
 	}
 	cloned["codebuff_metadata"] = metadata
-
-	// Inject OpenRouter provider routing options, matching the CLI's
-	// getProviderOptions() output. The backend expects this for free-mode
-	// routing decisions.
-	if _, exists := cloned["provider"]; !exists {
-		cloned["provider"] = map[string]any{
-			"allow_fallbacks": true,
-		}
-	}
 
 	body, err := json.Marshal(cloned)
 	if err != nil {
@@ -790,11 +771,15 @@ func (s *Server) handleUsage(w http.ResponseWriter, r *http.Request) {
 }
 
 func isRunInvalid(statusCode int, body []byte) bool {
-	if statusCode != http.StatusBadRequest {
+	if statusCode != http.StatusBadRequest && statusCode != http.StatusForbidden {
 		return false
 	}
 	message := strings.ToLower(string(body))
-	return strings.Contains(message, "runid not found") || strings.Contains(message, "runid not running")
+	return strings.Contains(message, "runid not found") ||
+		strings.Contains(message, "runid not running") ||
+		strings.Contains(message, "free_mode_invalid_agent_hierarchy") ||
+		strings.Contains(message, "free_mode_cli_required") ||
+		strings.Contains(message, "invalid_agent_run")
 }
 
 func writePassthroughError(w http.ResponseWriter, statusCode int, body []byte) {

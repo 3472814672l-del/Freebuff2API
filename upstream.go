@@ -3,19 +3,14 @@ package main
 import (
 	"bytes"
 	"context"
-	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
 	"time"
-
-	utls "github.com/refraction-networking/utls"
-	"golang.org/x/net/http2"
 )
 
 type UpstreamClient struct {
@@ -24,76 +19,13 @@ type UpstreamClient struct {
 	userAgent  string
 }
 
-// utlsConn wraps a utls.UConn to implement the ConnectionState method
-// that Go's http2 transport needs to detect ALPN negotiation.
-type utlsConn struct {
-	*utls.UConn
-}
-
-// newUTLSTransport creates an HTTP/2 transport that uses uTLS for TLS,
-// presenting a Chrome-like TLS fingerprint to bypass server-side CLI detection.
-func newUTLSTransport(proxyURL *url.URL, timeout time.Duration) http.RoundTripper {
-	// Dialer for TCP connections.
-	dialer := &net.Dialer{
-		Timeout:   30 * time.Second,
-		KeepAlive: 30 * time.Second,
-	}
-
-	// Custom dial function that returns a uTLS connection with Chrome fingerprint.
-	dialTLS := func(ctx context.Context, network, addr string) (net.Conn, error) {
-		host, _, err := net.SplitHostPort(addr)
-		if err != nil {
-			return nil, fmt.Errorf("split address: %w", err)
-		}
-
-		tcpConn, err := dialer.DialContext(ctx, network, addr)
-		if err != nil {
-			return nil, fmt.Errorf("dial TCP: %w", err)
-		}
-
-		tlsConfig := &utls.Config{
-			ServerName: host,
-			MinVersion: tls.VersionTLS12,
-			NextProtos: []string{"h2", "http/1.1"}, // Offer both h2 and http/1.1.
-		}
-
-		uConn := utls.UClient(tcpConn, tlsConfig, utls.HelloChrome_120)
-
-		// Build handshake state to modify ALPN if needed.
-		if err := uConn.BuildHandshakeState(); err != nil {
-			tcpConn.Close()
-			return nil, fmt.Errorf("build handshake state: %w", err)
-		}
-
-		if err := uConn.HandshakeContext(ctx); err != nil {
-			tcpConn.Close()
-			return nil, fmt.Errorf("TLS handshake: %w", err)
-		}
-
-		return uConn, nil
-	}
-
-	// Create an http2.Transport with our custom dialer.
-	// This gives us HTTP/2 framing over uTLS connections.
-	h2transport := &http2.Transport{
-		DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
-			return dialTLS(ctx, network, addr)
-		},
-		AllowHTTP: false,
-	}
-
-	return h2transport
-}
-
 func NewUpstreamClient(cfg Config) *UpstreamClient {
-	var proxyURL *url.URL
+	transport := http.DefaultTransport.(*http.Transport).Clone()
 	if cfg.HTTPProxy != "" {
-		if parsed, err := url.Parse(cfg.HTTPProxy); err == nil {
-			proxyURL = parsed
+		if proxyURL, err := url.Parse(cfg.HTTPProxy); err == nil {
+			transport.Proxy = http.ProxyURL(proxyURL)
 		}
 	}
-
-	transport := newUTLSTransport(proxyURL, cfg.RequestTimeout)
 
 	return &UpstreamClient{
 		baseURL: cfg.UpstreamBaseURL,
@@ -105,10 +37,14 @@ func NewUpstreamClient(cfg Config) *UpstreamClient {
 	}
 }
 
-func (c *UpstreamClient) StartRun(ctx context.Context, authToken, agentID string) (string, error) {
+func (c *UpstreamClient) StartRun(ctx context.Context, authToken, agentID string, ancestorRunIds ...string) (string, error) {
+	if ancestorRunIds == nil {
+		ancestorRunIds = []string{}
+	}
 	payload := map[string]any{
-		"action":  "START",
-		"agentId": agentID,
+		"action":         "START",
+		"agentId":        agentID,
+		"ancestorRunIds": ancestorRunIds,
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {

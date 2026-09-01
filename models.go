@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"math/rand"
 	"net/http"
 	"regexp"
 	"sort"
@@ -17,28 +16,19 @@ import (
 const (
 	freeAgentsSourceURL  = "https://raw.githubusercontent.com/CodebuffAI/codebuff/main/common/src/constants/free-agents.ts"
 	modelRefreshInterval = 6 * time.Hour
+	rootAgentID          = "base2-free"
 )
 
-// hardcodedFallback is used when the remote fetch fails on startup.
-// Updated 2026-09-01 from Codebuff source code analysis.
+// hardcodedFallback 为内置模型注册表。所有子代理均在请求时挂载在根 agent (base2-free) 之下。
 var hardcodedFallback = map[string][]string{
-	"base2-free":                  {"mimo/mimo-v2.5", "z-ai/glm-5.3-flash", "z-ai/glm-5.2"},
-	"base2-free-mimo":              {"mimo/mimo-v2.5"},
-	"base2-free-glm":               {"z-ai/glm-5.2"},
-	"base2-free-glm-5-3-flash":     {"z-ai/glm-5.3-flash"},
-	"base2-free-luna":              {"openai/gpt-5.6-luna"},
-	"base2-free-luna-es":           {"openai/gpt-5.6-luna-es"},
-	"base2-free-solar-pro4":        {"upstage/solar-pro4"},
-	"base2-free-ox-alpha":          {"stealth/ox-alpha"},
-	"base2-free-fable":             {"anthropic/claude-fable-5"},
-	"base2-free-muse-spark":        {"meta/muse-spark-1.2-contributor"},
-	"base2-free-kimi-k3-eco":      {"crof/kimi-k3-eco"},
-	"base2-free-deepseek":          {"deepseek/deepseek-v4-pro"},
-	"base2-free-deepseek-flash":    {"deepseek/deepseek-v4-flash"},
-	"base2-free-deepseek-pro-max":  {"deepseek/deepseek-v4-pro-max"},
-	"base2-free-deepseek-flash-max": {"deepseek/deepseek-v4-flash-max"},
-	"base2-free-luna-max":          {"openai/gpt-5.6-luna-max"},
-	"base2-free-cloud-planner":     {"mimo/mimo-v2.5"},
+	"file-picker":                 {"google/gemini-2.5-flash-lite"},
+	"file-picker-max":             {"google/gemini-3.5-flash-lite", "google/gemini-3.1-flash-lite-preview", "google/gemini-3-flash-preview"},
+	"file-lister":                 {"google/gemini-3.5-flash-lite", "google/gemini-3.1-flash-lite-preview"},
+	"researcher-web":              {"google/gemini-3.5-flash-lite", "google/gemini-3.1-flash-lite-preview"},
+	"researcher-docs":             {"google/gemini-3.5-flash-lite", "google/gemini-3.1-flash-lite-preview"},
+	"basher":                      {"google/gemini-3.5-flash-lite", "google/gemini-3.1-flash-lite-preview"},
+	"browser-use":                 {"google/gemini-3.5-flash-lite", "google/gemini-3.1-flash-lite-preview"},
+	"code-reviewer-mimo":          {"mimo/mimo-v2.5"},
 }
 
 // pausedFreeModels lists models withdrawn from free mode by Codebuff.
@@ -140,11 +130,40 @@ func (r *ModelRegistry) IsPausedModel(model string) bool {
 	return known && pausedFreeModels[model]
 }
 
-// AgentForModel returns the agent ID that should serve the given model.
-func (r *ModelRegistry) AgentForModel(model string) (string, bool) {
+// ResolveModelAndAgent maps any model ID (including common aliases like gemini-2.5-flash-lite, gpt-4o, claude-3-5-sonnet, etc.)
+// to the actual upstream model ID and serving agent ID.
+func (r *ModelRegistry) ResolveModelAndAgent(model string) (targetModel string, agentID string, ok bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	agent, ok := r.modelToAgent[model]
+
+	// 1. Direct match
+	if agent, exists := r.modelToAgent[model]; exists {
+		return model, agent, true
+	}
+
+	// 2. Alias match
+	normalized := strings.ToLower(strings.TrimSpace(model))
+	switch {
+	case strings.Contains(normalized, "mimo"):
+		return "mimo/mimo-v2.5", "code-reviewer-mimo", true
+	case strings.Contains(normalized, "3.5"):
+		return "google/gemini-3.5-flash-lite", "file-picker-max", true
+	case strings.Contains(normalized, "3.1") || strings.Contains(normalized, "gemini-3"):
+		return "google/gemini-3.1-flash-lite-preview", "file-picker-max", true
+	case strings.Contains(normalized, "gemini") || strings.Contains(normalized, "flash-lite"):
+		return "google/gemini-2.5-flash-lite", "file-picker", true
+	default:
+		// Default fallback for generic names (e.g. gpt-4o, claude-3-5-sonnet, default)
+		if agent, exists := r.modelToAgent["google/gemini-2.5-flash-lite"]; exists {
+			return "google/gemini-2.5-flash-lite", agent, true
+		}
+		return "google/gemini-2.5-flash-lite", "file-picker", true
+	}
+}
+
+// AgentForModel returns the agent ID that should serve the given model.
+func (r *ModelRegistry) AgentForModel(model string) (string, bool) {
+	_, agent, ok := r.ResolveModelAndAgent(model)
 	return agent, ok
 }
 
@@ -247,7 +266,8 @@ func parseAllFreeModels(source string) map[string][]string {
 }
 
 // buildModelMapping creates the model→agent reverse mapping and deduplicated model list.
-// When a model appears in multiple agents, one is chosen at random.
+// When a model appears in multiple agents, the most specific agent (fewest models)
+// is chosen to ensure exact agent↔model pairing for free-mode validation.
 func buildModelMapping(agentModels map[string][]string) (map[string]string, []string) {
 	modelAgents := make(map[string][]string)
 	for agentID, models := range agentModels {
@@ -259,7 +279,18 @@ func buildModelMapping(agentModels map[string][]string) (map[string]string, []st
 	modelToAgent := make(map[string]string, len(modelAgents))
 	allModels := make([]string, 0, len(modelAgents))
 	for model, agents := range modelAgents {
-		modelToAgent[model] = agents[rand.Intn(len(agents))]
+		// Pick the most specific agent: the one that handles the fewest models.
+		// This ensures e.g. "base2-free-glm-5-3-flash" is preferred over "base2-free"
+		// for model "z-ai/glm-5.3-flash".
+		best := agents[0]
+		bestCount := len(agentModels[best])
+		for _, a := range agents[1:] {
+			if c := len(agentModels[a]); c < bestCount {
+				best = a
+				bestCount = c
+			}
+		}
+		modelToAgent[model] = best
 		allModels = append(allModels, model)
 	}
 	sort.Strings(allModels)

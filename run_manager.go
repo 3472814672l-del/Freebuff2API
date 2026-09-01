@@ -30,6 +30,7 @@ type tokenPool struct {
 
 	mu               sync.Mutex
 	runs             map[string]*managedRun // agentID -> current run
+	rootRun          *managedRun            // 唯一根 run (base2-free)，所有 subagent run 的直接祖先
 	draining         []*managedRun
 	session          *cachedSession
 	sessionRefreshCh chan struct{}
@@ -123,11 +124,9 @@ func NewRunManager(cfg Config, client *UpstreamClient, logger *log.Logger) *RunM
 	}
 }
 
-func (m *RunManager) Start(ctx context.Context, agentIDs []string) {
-	// Pre-warm runs for all free agents in background.
-	// The server is already listening; if a request arrives before
-	// pre-warming finishes, acquire() will lazily create the run.
-	go m.prewarm(agentIDs)
+func (m *RunManager) Start(ctx context.Context, _ []string) {
+	// 后台只预热根 run (base2-free)；子 run 随请求惰性创建。
+	go m.prewarm()
 
 	m.wg.Add(1)
 	go func() {
@@ -152,7 +151,7 @@ func (m *RunManager) Start(ctx context.Context, agentIDs []string) {
 	}()
 }
 
-func (m *RunManager) prewarm(agentIDs []string) {
+func (m *RunManager) prewarm() {
 	ctx, cancel := context.WithTimeout(context.Background(), m.cfg.RequestTimeout)
 	defer cancel()
 
@@ -160,12 +159,10 @@ func (m *RunManager) prewarm(agentIDs []string) {
 		if _, err := pool.ensureSession(ctx); err != nil {
 			m.logger.Printf("%s: free session prewarm failed: %v", pool.name, err)
 		}
-		for _, agentID := range agentIDs {
-			if err := pool.rotateAgent(ctx, agentID); err != nil {
-				m.logger.Printf("%s: prewarm %s failed: %v", pool.name, agentID, err)
-			} else {
-				m.logger.Printf("%s: prewarmed %s", pool.name, agentID)
-			}
+		if err := pool.rotateAgent(ctx, rootAgentID); err != nil {
+			m.logger.Printf("%s: prewarm root %s failed: %v", pool.name, rootAgentID, err)
+		} else {
+			m.logger.Printf("%s: prewarmed root %s", pool.name, rootAgentID)
 		}
 	}
 }
@@ -246,29 +243,41 @@ func (m *RunManager) Snapshots() []tokenSnapshot {
 }
 
 func (p *tokenPool) acquire(ctx context.Context, agentID string) (*runLease, error) {
+	if _, err := p.ensureSession(ctx); err != nil {
+		return nil, err
+	}
+
 	p.mu.Lock()
 	if now := time.Now(); now.Before(p.cooldownUntil) {
 		cooldownUntil := p.cooldownUntil
 		p.mu.Unlock()
 		return nil, fmt.Errorf("token cooling down until %s", cooldownUntil.Format(time.RFC3339))
 	}
+	root := p.rootRun
+	rootNeedsRotate := root == nil || time.Since(root.startedAt) >= p.cfg.RotationInterval
 	run := p.runs[agentID]
 	needsRotate := run == nil || time.Since(run.startedAt) >= p.cfg.RotationInterval
 	p.mu.Unlock()
 
-	if needsRotate {
+	// 先保活根 run（会话根），再轮换目标 agent。
+	if rootNeedsRotate {
+		if err := p.rotateAgent(ctx, rootAgentID); err != nil {
+			return nil, fmt.Errorf("rotate root agent: %w", err)
+		}
+	}
+	if agentID != rootAgentID && needsRotate {
 		if err := p.rotateAgent(ctx, agentID); err != nil {
 			return nil, err
 		}
 	}
 
-	if _, err := p.ensureSession(ctx); err != nil {
-		return nil, err
-	}
-
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	run = p.runs[agentID]
+	if agentID == rootAgentID {
+		run = p.rootRun
+	} else {
+		run = p.runs[agentID]
+	}
 	if run == nil {
 		return nil, errors.New("run missing after rotation")
 	}
@@ -289,9 +298,16 @@ func (p *tokenPool) maintain(ctx context.Context) error {
 			toRotate = append(toRotate, agentID)
 		}
 	}
+	rootExpired := p.rootRun == nil || time.Since(p.rootRun.startedAt) >= p.cfg.RotationInterval
 	draining := append([]*managedRun(nil), p.draining...)
 	p.mu.Unlock()
 
+	// 根 run 过期时优先轮换根，子 run 的祖先才能指向新根。
+	if rootExpired {
+		if err := p.rotateAgent(ctx, rootAgentID); err != nil {
+			p.logger.Printf("%s: rotate root agent failed: %v", p.name, err)
+		}
+	}
 	for _, agentID := range toRotate {
 		if err := p.rotateAgent(ctx, agentID); err != nil {
 			p.logger.Printf("%s: rotate agent %s failed: %v", p.name, agentID, err)
@@ -311,6 +327,10 @@ func (p *tokenPool) shutdown(ctx context.Context) error {
 	var allRuns []*managedRun
 	for _, run := range p.runs {
 		allRuns = append(allRuns, run)
+	}
+	if p.rootRun != nil {
+		allRuns = append(allRuns, p.rootRun)
+		p.rootRun = nil
 	}
 	allRuns = append(allRuns, p.draining...)
 	p.runs = make(map[string]*managedRun)
@@ -339,9 +359,14 @@ func (p *tokenPool) rotateAgent(ctx context.Context, agentID string) error {
 		p.mu.Unlock()
 		return fmt.Errorf("token cooling down until %s", cooldownUntil.Format(time.RFC3339))
 	}
+	// 非根 run 的祖先只能是根 run；根 run 传空数组（上游不接受 null）。
+	ancestors := []string{}
+	if agentID != rootAgentID && p.rootRun != nil && p.rootRun.id != "" {
+		ancestors = []string{p.rootRun.id}
+	}
 	p.mu.Unlock()
 
-	runID, err := p.client.StartRun(ctx, p.token, agentID)
+	runID, err := p.client.StartRun(ctx, p.token, agentID, ancestors...)
 	if err != nil {
 		p.mu.Lock()
 		p.lastError = err.Error()
@@ -350,11 +375,18 @@ func (p *tokenPool) rotateAgent(ctx context.Context, agentID string) error {
 	}
 
 	p.mu.Lock()
-	oldRun := p.runs[agentID]
-	p.runs[agentID] = &managedRun{
+	newRun := &managedRun{
 		id:        runID,
 		agentID:   agentID,
 		startedAt: time.Now(),
+	}
+	var oldRun *managedRun
+	if agentID == rootAgentID {
+		oldRun = p.rootRun
+		p.rootRun = newRun
+	} else {
+		oldRun = p.runs[agentID]
+		p.runs[agentID] = newRun
 	}
 	p.lastError = ""
 	if oldRun != nil {
@@ -394,8 +426,13 @@ func (p *tokenPool) finishIfReady(run *managedRun) error {
 		p.mu.Unlock()
 		return nil
 	}
-	// Only finish if this run is no longer the current run for its agent
-	if current, ok := p.runs[run.agentID]; ok && current == run {
+	// 当前仍在服役的 run（子 run 在 runs 表、根 run 在 rootRun）不能提前结束。
+	if run.agentID == rootAgentID {
+		if p.rootRun == run {
+			p.mu.Unlock()
+			return nil
+		}
+	} else if current, ok := p.runs[run.agentID]; ok && current == run {
 		p.mu.Unlock()
 		return nil
 	}
@@ -429,7 +466,9 @@ func (p *tokenPool) invalidate(run *managedRun, reason string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	// Remove from current runs if it matches
+	if run.agentID == rootAgentID && p.rootRun == run {
+		p.rootRun = nil
+	}
 	if current, ok := p.runs[run.agentID]; ok && current == run {
 		delete(p.runs, run.agentID)
 	}
@@ -475,6 +514,15 @@ func (p *tokenPool) snapshot() tokenSnapshot {
 		snapshot.SessionPosition = p.session.position
 		snapshot.SessionQueueDepth = p.session.queueDepth
 		snapshot.SessionPollAt = p.session.pollAt
+	}
+	if p.rootRun != nil {
+		snapshot.Runs = append(snapshot.Runs, runSnapshot{
+			AgentID:      p.rootRun.agentID,
+			RunID:        p.rootRun.id,
+			StartedAt:    p.rootRun.startedAt,
+			Inflight:     p.rootRun.inflight,
+			RequestCount: p.rootRun.requestCount,
+		})
 	}
 	for agentID, run := range p.runs {
 		snapshot.Runs = append(snapshot.Runs, runSnapshot{
