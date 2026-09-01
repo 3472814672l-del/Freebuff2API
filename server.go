@@ -339,7 +339,7 @@ func (s *Server) proxyChatRequest(
 			return
 		}
 
-		upstreamBody, err := s.injectUpstreamMetadata(payload, requestedModel, lease.run.id, sessionInstanceID)
+		upstreamBody, err := s.injectUpstreamMetadata(payload, requestedModel, lease.run.id, sessionInstanceID, agentID)
 		if err != nil {
 			s.runs.Release(lease)
 			writeError(w, http.StatusBadRequest, err.Error(), invalidRequestType, "")
@@ -397,7 +397,7 @@ func writeOpenAISuccessResponse(w http.ResponseWriter, resp *http.Response) erro
 	return copyResponseBody(w, resp.Body)
 }
 
-func (s *Server) injectUpstreamMetadata(payload map[string]any, requestedModel, runID, sessionInstanceID string) ([]byte, error) {
+func (s *Server) injectUpstreamMetadata(payload map[string]any, requestedModel, runID, sessionInstanceID, agentID string) ([]byte, error) {
 	cloned := cloneMap(payload)
 	cloned["model"] = requestedModel
 
@@ -415,10 +415,22 @@ func (s *Server) injectUpstreamMetadata(payload map[string]any, requestedModel, 
 	metadata["run_id"] = runID
 	metadata["cost_mode"] = "free"
 	metadata["client_id"] = generateClientSessionId()
+	if strings.TrimSpace(agentID) != "" {
+		metadata["agent_id"] = agentID
+	}
 	if strings.TrimSpace(sessionInstanceID) != "" {
 		metadata["freebuff_instance_id"] = sessionInstanceID
 	}
 	cloned["codebuff_metadata"] = metadata
+
+	// Inject OpenRouter provider routing options, matching the CLI's
+	// getProviderOptions() output. The backend expects this for free-mode
+	// routing decisions.
+	if _, exists := cloned["provider"]; !exists {
+		cloned["provider"] = map[string]any{
+			"allow_fallbacks": true,
+		}
+	}
 
 	body, err := json.Marshal(cloned)
 	if err != nil {

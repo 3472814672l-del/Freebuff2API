@@ -189,7 +189,10 @@ func containsString(values []string, needle string) bool {
 }
 
 func generateUserAgent() string {
-	return "ai-sdk/openai-compatible/1.0.25/codebuff"
+	// The real Freebuff CLI is compiled with Bun and sends "Bun/1.3.14" as its
+	// User-Agent. The upstream server uses TLS fingerprinting (not User-Agent)
+	// to verify CLI origin, but we still match the UA for completeness.
+	return "Bun/1.3.14"
 }
 
 // generateClientSessionId generates a per-request session ID matching the

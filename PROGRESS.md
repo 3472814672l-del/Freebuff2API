@@ -120,27 +120,34 @@ WantedBy=multi-user.target
 
 ### 4.1 问题：`free_mode_cli_required`
 
-**错误信息**：
-```json
-{
-  "error": {
-    "code": "free_mode_cli_required",
-    "message": "Free mode is only available through the freebuff CLI. Install it with `npm i -g freebuff`, then run `freebuff`. Calling the API directly is not supported and may get your account banned.",
-    "type": "upstream_error"
-  }
-}
-```
+**当前状态**：已部分突破，chat/completions 仍被拦截
 
-**触发条件**：调用 `/v1/chat/completions` 时，上游返回此错误。
+**根因分析（2026-09-01 更新）**：
 
-**根因分析**：Freebuff 上游新增了 CLI 客户端检测，直接调 API 会被识别为非 CLI 请求并拒绝。可能检测点：
+通过在 VM 上安装 Freebuff CLI（Bun 编译二进制，139MB）并用 mitmproxy 抓包，发现：
 
-1. **User-Agent**：当前为 `ai-sdk/openai-compatible/1.0.25/codebuff`，可能需要改为 `freebuff-cli/<version>` 或 `node-fetch` 等
-2. **缺少特定请求头**：Freebuff CLI 可能在请求中发送额外的 header（如 `x-codebuff-client` / `x-freebuff-cli-version` 等）
-3. **`codebuff_metadata` 字段不全**：可能需要 `client_name`、`cli_version`、`source` 等字段
-4. **请求体结构差异**：CLI 可能在 payload 中有额外字段
+1. **CLI UA 是 `Bun/1.3.14`**，不是 AI SDK 的复合字符串
+2. **CLI 检测不基于 User-Agent** — 用任何 UA + 不带 run_id 都返回 `No runId found`
+3. **CLI 检测在 `/api/v1/chat/completions` 端点**，不在 `/api/v1/agent-runs` 端点
+   - agent-runs（prewarm）用 uTLS Chrome 120 指纹成功
+   - chat/completions 仍被拦截返回 `free_mode_cli_required`
+4. **CLI 检测基于 HTTP/2 协议指纹**，不基于 TLS 或 UA
+   - curl --http2 也被拦截
+   - Go http2.Transport over uTLS 也被拦截
+   - 可能检测点：HTTP/2 SETTINGS 帧参数、HEADERS 帧伪头顺序、WINDOW_UPDATE 帧等
+5. **run_id 触发检测**：
+   - 不带 run_id → 返回 `No runId found`（不执行 CLI 检测）
+   - 带有效 run_id → 执行 CLI 检测 → 返回 `free_mode_cli_required`
 
-**下一步**：需要安装 `npm i -g freebuff` CLI，抓包分析它发送的实际请求（header + body），对比 Freebuff2API 的请求差异，然后在 `upstream.go` 和 `server.go` 中补齐。
+**已完成的代码变更**：
+- `upstream.go`：用 uTLS Chrome 120 指纹替换标准 TLS transport，支持 HTTP/2 over uTLS
+- `config.go`：UA 从 `ai-sdk/openai-compatible/1.0.25/codebuff` 改为 `Bun/1.3.14`
+- `go.mod`：新增 `golang.org/x/net/http2` 依赖
+
+**下一步方向**：
+1. 深入分析 Bun 的 HTTP/2 实现（SETTINGS、HEADERS 帧）与 Go http2 的差异
+2. 或用 mitmproxy 拦截 CLI 的 HTTP/2 流量，对比帧参数差异
+3. 或考虑用 Bun 运行时本身作为代理后端
 
 ### 4.2 模型 ID 变更
 
